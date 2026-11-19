@@ -289,6 +289,111 @@ Describe 'Push-BECRun' {
         $R.Score.Value | Should -Be 36
     }
 
+    It 'stores no raw mailbox records and re-reads different records in the attacker-activity phase' {
+        $script:MailCalls = 0
+        Mock Get-CIPPBecMailActivity {
+            $script:MailCalls++
+            $R = Empty
+            $R | Add-Member -NotePropertyName Summary -NotePropertyValue ([pscustomobject]@{ HardDeleteExceeded = $false }) -Force
+            $Record = if ($script:MailCalls -eq 1) {
+                [pscustomobject]@{ Identity = 'counts-pass'; AuditData = [pscustomobject]@{ Operation = 'Send'; ClientIP = '203.0.113.10' } }
+            } else {
+                [pscustomobject]@{ Identity = 'detail-pass'; AuditData = [pscustomobject]@{ Operation = 'Send'; ClientIP = '203.0.113.10' } }
+            }
+            $R | Add-Member -NotePropertyName Records -NotePropertyValue @($Record) -Force
+            $R
+        }
+        Invoke-BecRun -Item $script:Item
+        @($script:StateWrites | Where-Object { $_.Names -contains 'MailRecords' }).Count | Should -Be 0 -Because 'the multi-megabyte records never enter the run state'
+        @($script:AttackerInput.MailRecords).Count | Should -Be 1
+        $script:AttackerInput.MailRecords[0].Identity | Should -Be 'detail-pass' -Because 'the attacker pass uses its own re-read, not the counts pass'
+        Should -Invoke Get-CIPPBecMailActivity -Times 2 -Exactly -Because 'the Activity phase counts, and AttackerActivity re-reads the records'
+    }
+
+    It 'marks only the attacker mail section incomplete when the re-read is capped' {
+        $script:MailCalls = 0
+        Mock Get-CIPPBecMailActivity {
+            $script:MailCalls++
+            if ($script:MailCalls -eq 1) {
+                $R = Empty
+                $R | Add-Member -NotePropertyName Summary -NotePropertyValue ([pscustomobject]@{ HardDeleteExceeded = $false }) -Force
+                $R | Add-Member -NotePropertyName Records -NotePropertyValue @([pscustomobject]@{ Identity = 'counts-pass'; AuditData = [pscustomobject]@{ Operation = 'Send'; ClientIP = '203.0.113.10' } }) -Force
+            } else {
+                $R = New-CIPPBecCollectorResult -Data @() -Complete $false -Cap '10 pages of 5000 records'
+                $R | Add-Member -NotePropertyName Summary -NotePropertyValue ([pscustomobject]@{ HardDeleteExceeded = $false }) -Force
+                $R | Add-Member -NotePropertyName Records -NotePropertyValue @([pscustomobject]@{ Identity = 'detail-pass'; AuditData = [pscustomobject]@{ Operation = 'Send'; ClientIP = '203.0.113.10' } }) -Force
+            }
+            $R
+        }
+        Invoke-BecRun -Item $script:Item
+        $R = $script:Saved.Results
+        $R.Completeness.MailActivity.Complete | Should -BeTrue -Because 'the counts pass completed'
+        $R.Completeness.AttackerMailActivity.Complete | Should -BeFalse
+        $R.Completeness.AttackerMailActivity.Cap | Should -Be '10 pages of 5000 records'
+        $script:AttackerInput.MailRecords[0].Identity | Should -Be 'detail-pass'
+    }
+
+    It 'keeps files and Forms when the attacker mail re-read fails' {
+        $script:MailCalls = 0
+        Mock Get-CIPPBecMailActivity {
+            $script:MailCalls++
+            if ($script:MailCalls -eq 1) {
+                $R = Empty
+                $R | Add-Member -NotePropertyName Summary -NotePropertyValue ([pscustomobject]@{ HardDeleteExceeded = $false }) -Force
+                $R | Add-Member -NotePropertyName Records -NotePropertyValue @() -Force
+                return $R
+            }
+            throw 'mail re-read timed out'
+        }
+        Invoke-BecRun -Item $script:Item
+        $R = $script:Saved.Results
+        $R.Completeness.AttackerMailActivity.Complete | Should -BeFalse
+        $R.Completeness.AttackerMailActivity.Error | Should -Match 'mail re-read timed out'
+        $R.Completeness.AttackerFileActivity.Complete | Should -BeTrue
+        $R.Completeness.FormsActivity.Complete | Should -BeTrue
+        $R.Completeness.BlastRadius.Complete | Should -BeTrue
+    }
+
+    It 'skips the mail re-read when no address is attacker-side' {
+        Mock Invoke-CIPPBecIPAnalysis {
+            [pscustomobject]@{
+                Baseline    = New-CIPPBecCollectorResult -Data ([pscustomobject]@{ Successful = 1 }) -Count 1
+                Guidance    = New-CIPPBecCollectorResult -Data @()
+                PeersResult = New-CIPPBecCollectorResult -Data @()
+                Peers       = @{}
+                Geo         = @{}
+                Events      = @()
+                Verdicts    = @([pscustomobject]@{ IP = '203.0.113.10'; Verdict = 'LikelyUser'; SuccessfulSignIns = 1; Activities = 1; Reasons = @() })
+            }
+        }
+        Invoke-BecRun -Item $script:Item
+        Should -Invoke Get-CIPPBecMailActivity -Times 1 -Exactly -Because 'the Activity phase counts, and a clean case has nothing to itemise'
+        $script:Saved.Results.Completeness.AttackerMailActivity.Complete | Should -BeTrue
+    }
+
+    It 'keeps both the re-read error and the subject-resolution error' {
+        $script:MailCalls = 0
+        Mock Get-CIPPBecMailActivity {
+            $script:MailCalls++
+            if ($script:MailCalls -eq 1) {
+                $R = Empty
+                $R | Add-Member -NotePropertyName Summary -NotePropertyValue ([pscustomobject]@{ HardDeleteExceeded = $false }) -Force
+                $R | Add-Member -NotePropertyName Records -NotePropertyValue @() -Force
+                return $R
+            }
+            throw 'mail re-read timed out'
+        }
+        Mock Get-CIPPBecAttackerActivity {
+            $Mail = New-CIPPBecCollectorResult -Data @() -Error 'subject lookup failed'
+            $Mail | Add-Member -NotePropertyName Summary -NotePropertyValue ([pscustomobject]@{ MessagesOpened = 0 }) -Force
+            [pscustomobject]@{ Mail = $Mail; Files = (Empty); LinkUsage = (Empty); Forms = (Empty); Subjects = $null }
+        }
+        Invoke-BecRun -Item $script:Item
+        $Error = $script:Saved.Results.Completeness.AttackerMailActivity.Error
+        $Error | Should -Match 'subject lookup failed'
+        $Error | Should -Match 'mail re-read timed out'
+    }
+
     It 'resolves a missing UPN from the object id, writes it back, and runs the investigation' {
         # A run queued with only the object id (an API/MCP caller, or a page race) must not run the
         # mailbox collectors with an empty UPN; the run resolves it from the id first.
@@ -335,6 +440,9 @@ Describe 'Push-BECRun' {
         $R.Completeness.AuditLog.Complete | Should -BeFalse
         $R.Completeness.AuditLog.Error | Should -Match 'disabled'
         $R.InboxRuleChanges.Count | Should -Be 0
+        $R.Completeness.AttackerMailActivity.Complete | Should -BeFalse
+        $R.Completeness.AttackerMailActivity.Error | Should -Match 'disabled'
+        Should -Invoke Get-CIPPBecMailActivity -Times 0 -Because 'neither pass searches the audit log when ingestion is disabled'
         Should -Invoke Search-CIPPBecAuditLog -Times 0
     }
 

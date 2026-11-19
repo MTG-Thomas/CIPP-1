@@ -11,8 +11,8 @@ function Get-CIPPBecMailActivity {
         folders or item ids are kept in the counts. MailItemsAccessed is part of Audit (Standard) for
         E3/E5 licences; when the log does not carry it the other operations still count. Each row also
         lists the mailbox SessionIds it saw (one session moving between addresses is one actor), and
-        the raw records ride along on the result (Records, not stored) so the attacker-activity pass
-        can take item-level detail for the attacker's addresses without searching again.
+        the raw records ride along on the result (Records, not stored) so the caller can take item-level detail
+        for the attacker's addresses.
     .PARAMETER TenantFilter
         Tenant default domain name.
     .PARAMETER UserPrincipalName
