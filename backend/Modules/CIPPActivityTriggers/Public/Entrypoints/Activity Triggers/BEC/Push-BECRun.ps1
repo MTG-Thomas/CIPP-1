@@ -88,7 +88,7 @@ function Push-BECRun {
                 'ReceivedMail' { 'AcceptedDomains' }
                 'Directory' { 'UsageLocation' }
                 { $_ -in @('IPAnalysis', 'IPPeers') } { 'SuspectUserSignIns', 'NonInteractiveSignIns', 'RuleChangesLog', 'PermissionsLog', 'SafelistChanges', 'SharingChanges', 'TransportRuleChanges', 'DirectoryAudits', 'SentMessages', 'SentMessageAnalysis', 'MailActivity', 'RulesLog', 'UsageLocation', 'TravelWindows', 'IPBaseline' }
-                'AttackerActivity' { 'IPVerdicts', 'IPPeers', 'ReceivedSubjects', 'SentSubjects', 'SuspectUserSignIns', 'NonInteractiveSignIns', 'AuditLogEnabled', 'SharingChanges', 'SuspectUserDetail', 'PermissionsLog', 'MailActivity' }
+                'AttackerActivity' { 'IPVerdicts', 'IPPeers', 'ReceivedSubjects', 'SentSubjects', 'SuspectUserSignIns', 'NonInteractiveSignIns', 'AuditLogEnabled', 'SharingChanges', 'SuspectUserDetail', 'PermissionsLog', 'MailActivity', 'Completeness' }
             })
         $State = if ($Key -eq 'Score') { Get-CIPPBecRunState -CaseId $CaseId } else { Get-CIPPBecRunState -CaseId $CaseId -Name $StateNames }
         # the first phase never started the run (no resolvable UPN), so there is nothing to add to
@@ -320,7 +320,7 @@ function Push-BECRun {
                 # Inbox-rule, safelist and sharing changes are all user-scoped to the same mailbox and window;
                 # only their operations differ, and the unified-audit-log session is the slow part. One combined
                 # search feeds all three (partitioned by operation locally) instead of three separate sessions.
-                $RuleOps = @('New-InboxRule', 'Set-InboxRule', 'Remove-InboxRule', 'UpdateInboxRules')
+                $RuleOps = @('New-InboxRule', 'Set-InboxRule', 'Remove-InboxRule', 'Enable-InboxRule', 'UpdateInboxRules')
                 $SafelistOps = @('Set-MailboxJunkEmailConfiguration')
                 $SharingOps = @('SharingSet', 'SharingInvitationCreated', 'AnonymousLinkCreated', 'AnonymousLinkUpdated', 'SecureLinkCreated', 'SecureLinkUpdated', 'AddedToSecureLink', 'CompanyLinkCreated')
                 $ChangeSearch = $null
@@ -373,8 +373,10 @@ function Push-BECRun {
                     $RulesLog = @()
                 }
 
-                # inbox rules carry no timestamps, so 'recent' = name-matches an audit event in the window; Outlook-client changes (UpdateInboxRules) carry no rule name and stay unflagged
-                $RecentRuleNames = @($RuleChangesLog | Where-Object { $_.Operation -in 'New-InboxRule', 'Set-InboxRule' } | ForEach-Object { ($_.RuleName -split '\\')[-1] })
+                # inbox rules carry no timestamps, so 'recent' = name-matches an audit event in the window; Outlook-client changes (UpdateInboxRules) carry no rule name and stay unflagged.
+                # Enable-InboxRule is included: an attacker re-enabling an old forwarder is the real risk, and the
+                # disable side is deliberately left out so CIPP's own containment does not add a change signal to a re-run.
+                $RecentRuleNames = @($RuleChangesLog | Where-Object { $_.Operation -in 'New-InboxRule', 'Set-InboxRule', 'Enable-InboxRule' } | ForEach-Object { ($_.RuleName -split '\\')[-1] })
                 $LowVisibilityRegex = [string]$Heuristics.inboxRules.lowVisibilityFolderRegex
                 $SensitiveNameRegex = [string]$Heuristics.inboxRules.sensitiveNameRegex
                 $SensitiveKeywordRegex = [string]$Heuristics.inboxRules.sensitiveKeywordRegex
@@ -422,7 +424,9 @@ function Push-BECRun {
                         @{ Name = 'RecentlyChanged'; Expression = { $_.Name -in $RecentRuleNames } },
                         @{ Name = 'RiskReasons'; Expression = { $Reasons.ToArray() } },
                         @{ Name = 'Suspicious'; Expression = { $Suspicious } },
-                        @{ Name = 'Risk'; Expression = { if ($Suspicious -or $Reasons.Count -gt 1) { 'High' } elseif ($Reasons.Count -eq 1) { 'Medium' } else { 'Review' } } }
+                        # Risk describes the rule's content; a disabled rule cannot act, so its current state is
+                        # shown separately as 'Disabled' and the score/frontend filter on Enabled.
+                        @{ Name = 'Risk'; Expression = { if ($Rule.Enabled -eq $false) { 'Disabled' } elseif ($Suspicious -or $Reasons.Count -gt 1) { 'High' } elseif ($Reasons.Count -eq 1) { 'Medium' } else { 'Review' } } }
                     })
 
                 Write-Information 'Getting trusted and blocked senders'
@@ -996,20 +1000,43 @@ function Push-BECRun {
                 # files touched, sharing links used, Forms built - and the other mailboxes the account reaches.
                 Write-Information 'Full scope: attacker activity'
                 $IPVerdicts = & $Rows 'IPVerdicts'
+                $MailActivity = & $Rows 'MailActivity'
                 $KnownSubjects = @{}
                 foreach ($Index in @($State.ReceivedSubjects, $State.SentSubjects | Where-Object { $_ })) {
                     foreach ($Pair in $Index.PSObject.Properties) { $KnownSubjects[$Pair.Name] = [string]$Pair.Value }
                 }
                 # The raw records are not in the run state: read them again here, as the IP review does.
-                # A clean investigation with no attacker-side address has nothing to itemise, so it pays nothing.
+                # Skip only when the counts and verdicts prove every mailbox address has a verdict and none
+                # is attacker-side; an unverdicted or address-less row could still resolve to Unknown.
                 $AttackerSide = @('Compromised', 'LikelyAttacker', 'Suspicious', 'Unknown')
-                $SideIPs = @($IPVerdicts | Where-Object { $_.IP -and $_.Verdict -in $AttackerSide } | ForEach-Object { [string]$_.IP } | Select-Object -Unique)
-                $ReadMail = $State.AuditLogEnabled -ne $false -and $SideIPs.Count -gt 0
+                $VerdictByIP = @{}
+                foreach ($Verdict in @($IPVerdicts)) {
+                    $VerdictIP = ConvertTo-CIPPBecHostAddress -Address $Verdict.IP
+                    if ($VerdictIP) { $VerdictByIP[$VerdictIP] = [string]$Verdict.Verdict }
+                }
+                $MailIPs = @($MailActivity | ForEach-Object { ConvertTo-CIPPBecHostAddress -Address $_.ClientIP } | Where-Object { $_ } | Select-Object -Unique)
+                $UnverdictedMail = @($MailIPs | Where-Object { -not $VerdictByIP.ContainsKey($_) }).Count -gt 0
+                $BlankMailAddress = @($MailActivity | Where-Object { -not (ConvertTo-CIPPBecHostAddress -Address $_.ClientIP) }).Count -gt 0
+                $SideIPs = @($VerdictByIP.Keys | Where-Object { $VerdictByIP[$_] -in $AttackerSide })
+                $VerdictMark = $State.Completeness['IPVerdicts']
+                $CountsMark = $State.Completeness['MailActivity']
+                $VerdictsComplete = [bool]($VerdictMark -and $VerdictMark.Complete -eq $true)
+                $CountsComplete = [bool]($CountsMark -and $CountsMark.Complete -eq $true)
+                $ReadMail = $State.AuditLogEnabled -ne $false -and (
+                    $SideIPs.Count -gt 0 -or $UnverdictedMail -or $BlankMailAddress -or -not $VerdictsComplete -or -not $CountsComplete
+                )
+                $MailBudgetSeconds = [int]($Heuristics.caps.attackerMailSeconds ?? 400)
                 $MailSearchTimer = [System.Diagnostics.Stopwatch]::StartNew()
-                $MailSearch = if (-not $ReadMail) { $null } else { & $Collect 'AttackerMailRecords' { Get-CIPPBecMailActivity -TenantFilter $TenantFilter -UserPrincipalName $UserName -StartDate $startDate -EndDate $endDate -Heuristics $Heuristics -Anchor $UserName } }
+                $MailSearch = if (-not $ReadMail) { $null } else {
+                    $Deadline = (Get-Date).ToUniversalTime().AddSeconds($MailBudgetSeconds)
+                    & $Collect 'AttackerMailRecords' { Get-CIPPBecMailActivity -TenantFilter $TenantFilter -UserPrincipalName $UserName -StartDate $startDate -EndDate $endDate -Heuristics $Heuristics -Anchor $UserName -Deadline $Deadline }
+                }
                 if ($ReadMail) {
-                    # the phase budget is finite: record the re-read cost so a busy tenant can be measured
-                    Write-LogMessage -API 'BECRun' -message "BEC mailbox re-read for $UserName took $([int]$MailSearchTimer.Elapsed.TotalSeconds)s (case $CaseId)" -tenant $TenantFilter -sev 'Info'
+                    try {
+                        Write-LogMessage -API 'BECRun' -message "BEC mailbox re-read for $UserName took $([int]$MailSearchTimer.Elapsed.TotalSeconds)s (case $CaseId)" -tenant $TenantFilter -sev 'Info'
+                    } catch {
+                        Write-Information "BEC: could not log the mailbox re-read time for $CaseId`: $($_.Exception.Message)"
+                    }
                 }
                 $Attacker = & $Collect 'AttackerActivity' { Get-CIPPBecAttackerActivity -TenantFilter $TenantFilter -UserPrincipalName $UserName -StartDate $startDate -EndDate $endDate -Heuristics $Heuristics -Verdicts $IPVerdicts -SignIns (& $Rows 'SuspectUserSignIns') -NonInteractiveSignIns (& $Rows 'NonInteractiveSignIns') -MailRecords @($MailSearch.Records | Where-Object { $_ }) -SharingChanges (& $Rows 'SharingChanges') -KnownSubjects $KnownSubjects -Anchor $UserName }
                 $MailMarker = if ($Attacker.PSObject.Properties['Mail']) { $Attacker.Mail } else { $Attacker }
@@ -1021,17 +1048,57 @@ function Push-BECRun {
                     Requirement = $MailMarker.Requirement
                     Count       = [int]$MailMarker.Count
                 }
-                $JoinErrors = { param($First, $Second) @(@($First, $Second) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join '; ' }
-                if ($State.AuditLogEnabled -eq $false) {
-                    $MailMarker.Complete = $false
-                    $MailMarker.Error = & $JoinErrors $MailMarker.Error 'Unified audit log ingestion is disabled for this tenant'
-                } elseif ($MailSearch -and (-not $MailSearch.Complete -or $MailSearch.Error)) {
-                    $MailMarker.Complete = $false
-                    if ($MailSearch.Cap) { $MailMarker.Cap = $MailSearch.Cap }
-                    $MailMarker.Error = & $JoinErrors $MailMarker.Error $MailSearch.Error
+                $Classify = { param($Text) if ([string]::IsNullOrWhiteSpace([string]$Text)) { $null } else { Get-CIPPBecErrorInfo -Message ([string]$Text) } }
+                $FailureTexts = [System.Collections.Generic.List[string]]::new()
+                $SkipTexts = [System.Collections.Generic.List[string]]::new()
+                $CapTexts = [System.Collections.Generic.List[string]]::new()
+                $AddDiagnostic = {
+                    param($Text)
+                    $Info = & $Classify $Text
+                    if (-not $Info) { return }
+                    if ($Info.Skipped) { $SkipTexts.Add([string]($Info.Requirement ?? $Info.Message)) } else { $FailureTexts.Add([string]$Info.Message) }
+                }
+                & $AddDiagnostic $MailMarker.Error
+                if ($MailSearch) {
+                    $LegErrors = if ($MailSearch.PSObject.Properties['Legs']) { @($MailSearch.Legs.Values | ForEach-Object { $_.Error }) } else { @($MailSearch.Error) }
+                    $LegCaps = if ($MailSearch.PSObject.Properties['Legs']) { @($MailSearch.Legs.Values | ForEach-Object { $_.Cap }) } else { @($MailSearch.Cap) }
+                    foreach ($Text in $LegErrors) { & $AddDiagnostic $Text }
+                    foreach ($Text in $LegCaps) { if ($Text) { $CapTexts.Add([string]$Text) } }
+                }
+                if ($State.AuditLogEnabled -eq $false) { $FailureTexts.Add('Unified audit log ingestion is disabled for this tenant') }
+                $MailComplete = [bool]$MailMarker.Complete
+                if ($FailureTexts.Count -gt 0) {
+                    $MailComplete = $false
+                    $MailSkipped = $false
+                    $MailRequirement = $null
+                    $MailError = (@($FailureTexts) + @($SkipTexts)) -join '; '
+                } elseif ($SkipTexts.Count -gt 0) {
+                    $MailComplete = $false
+                    $MailSkipped = $true
+                    $MailRequirement = $SkipTexts -join '; '
+                    $MailError = $null
+                } else {
+                    $MailSkipped = [bool]$MailMarker.Skipped
+                    $MailRequirement = $MailMarker.Requirement
+                    $MailError = $MailMarker.Error
+                }
+                if ($CapTexts.Count -gt 0) {
+                    $MailComplete = $false
+                    $MailCap = (@($CapTexts) | Select-Object -Unique) -join '; '
+                } else {
+                    $MailCap = $MailMarker.Cap
+                }
+                # Write the marker directly: $Mark would reclassify the joined text and could turn a real
+                # failure into a skip (its Exchange/no-mailbox patterns are unanchored).
+                $Completeness['AttackerMailActivity'] = [pscustomobject]@{
+                    Complete    = $MailComplete
+                    Cap         = $MailCap
+                    Error       = $MailError
+                    Skipped     = $MailSkipped
+                    Requirement = $MailRequirement
+                    Count       = [int]$MailMarker.Count
                 }
                 if ($Attacker.PSObject.Properties['Mail']) {
-                    & $Mark 'AttackerMailActivity' $MailMarker
                     & $Mark 'AttackerFileActivity' $Attacker.Files
                     & $Mark 'LinkUsage' $Attacker.LinkUsage
                     & $Mark 'FormsActivity' $Attacker.Forms
@@ -1040,7 +1107,6 @@ function Push-BECRun {
                     $LinkUsage = @($Attacker.LinkUsage.Data)
                     $FormsActivity = @($Attacker.Forms.Data); $FormsSummary = $Attacker.Forms.Summary
                 } else {
-                    & $Mark 'AttackerMailActivity' $MailMarker
                     foreach ($Name in @('AttackerFileActivity', 'LinkUsage', 'FormsActivity')) { & $Mark $Name $Attacker }
                     $AttackerMailActivity = @(); $AttackerMailSummary = $null; $AttackerFileActivity = @(); $AttackerFileSummary = $null; $LinkUsage = @(); $FormsActivity = @(); $FormsSummary = $null
                 }

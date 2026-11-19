@@ -20,7 +20,7 @@ BeforeAll {
     function New-CIPPAsyncDeployment { param($JobId, $Names, $StepTitles, $Source, $TenantFilter) $JobId }
     function Set-CIPPAsyncDeploymentStatus { param($JobId, $Name, $Status, $Logs) }
     function Set-CIPPAsyncDeploymentStep { param($JobId, $Name, $StepIndex, $StepStatus, $Message) }
-    function Search-CIPPBecAuditLog { param($TenantFilter, $StartDate, $EndDate, $Operations, $UserIds, $RecordType, $ObjectIds, $Anchor, $PageSize, $MaxPages) }
+    function Search-CIPPBecAuditLog { param($TenantFilter, $StartDate, $EndDate, $Operations, $UserIds, $RecordType, $ObjectIds, $Anchor, $PageSize, $MaxPages, $Deadline) }
     function Get-CIPPBecMessageTrace { param($TenantFilter, $SenderAddress, $RecipientAddress, $StartDate, $EndDate, $Anchor, $PageSize, $MaxPages) }
     # Full-scope collectors
     function Get-CIPPBecMailboxInventory { param($TenantFilter, $UserPrincipalName, $Heuristics, $AcceptedDomains) }
@@ -30,7 +30,7 @@ BeforeAll {
     function Get-CIPPBecDirectoryAudits { param($TenantFilter, $UserId, $StartDate, $Heuristics, $Cap) }
     function Get-CIPPBecRegisteredDevices { param($TenantFilter, $UserId, $StartDate) }
     function Get-CIPPBecNonInteractiveSignIns { param($TenantFilter, $UserId, $UsageLocation, $StartDate) }
-    function Get-CIPPBecMailActivity { param($TenantFilter, $UserPrincipalName, $StartDate, $EndDate, $Heuristics, $Anchor) }
+    function Get-CIPPBecMailActivity { param($TenantFilter, $UserPrincipalName, $StartDate, $EndDate, $Heuristics, $Anchor, $Deadline) }
     function Get-CIPPBecRiskState { param($TenantFilter, $UserId, $StartDate, $Cap) }
     function Get-CIPPBecRogueAppFeed { }
     function Get-CIPPPartnerUserLookup { @{} }
@@ -371,6 +371,43 @@ Describe 'Push-BECRun' {
         $script:Saved.Results.Completeness.AttackerMailActivity.Complete | Should -BeTrue
     }
 
+    It 're-reads mailbox detail when a mailbox address has no verdict' {
+        Mock Invoke-CIPPBecIPAnalysis {
+            [pscustomobject]@{
+                Baseline    = New-CIPPBecCollectorResult -Data ([pscustomobject]@{ Successful = 1 }) -Count 1
+                Guidance    = New-CIPPBecCollectorResult -Data @()
+                PeersResult = New-CIPPBecCollectorResult -Data @()
+                Peers       = @{}
+                Geo         = @{}
+                Events      = @()
+                Verdicts    = @([pscustomobject]@{ IP = '203.0.113.10'; Verdict = 'LikelyUser'; SuccessfulSignIns = 1; Activities = 1; Reasons = @() })
+            }
+        }
+        $script:MailCalls = 0
+        $script:MailDeadlines = [System.Collections.Generic.List[object]]::new()
+        Mock Get-CIPPBecMailActivity {
+            $script:MailCalls++
+            $script:MailDeadlines.Add($Deadline)
+            $R = New-CIPPBecCollectorResult -Data @([pscustomobject]@{ Operation = 'MailItemsAccessed'; ClientIP = '192.0.2.44'; Count = 1 }) -Count 1
+            $R | Add-Member -NotePropertyName Summary -NotePropertyValue ([pscustomobject]@{ HardDeleteExceeded = $false }) -Force
+            $R | Add-Member -NotePropertyName Records -NotePropertyValue @() -Force
+            $R
+        }
+        Invoke-BecRun -Item $script:Item
+        $script:MailCalls | Should -Be 2 -Because '192.0.2.44 has no verdict, so the collector would treat it as Unknown'
+        $script:MailDeadlines[1] | Should -Not -Be ([datetime]::MinValue)
+        $script:MailDeadlines[1] | Should -BeGreaterThan (Get-Date).ToUniversalTime() -Because 'the detail pass gets a wall-clock budget'
+        $script:Saved.Results.Completeness.AttackerMailActivity.Complete | Should -BeTrue
+    }
+
+    It 'does not stop the phase when the re-read timing log fails' {
+        Mock Write-LogMessage { if ($message -like 'BEC mailbox re-read*') { throw 'log down' } }
+        Invoke-BecRun -Item $script:Item
+        $script:Saved.Properties.Status | Should -Be 'Completed'
+        $script:Saved.Results.Completeness.AttackerFileActivity.Complete | Should -BeTrue
+        $script:Saved.Results.Completeness.FormsActivity.Complete | Should -BeTrue
+    }
+
     It 'keeps both the re-read error and the subject-resolution error' {
         $script:MailCalls = 0
         Mock Get-CIPPBecMailActivity {
@@ -649,6 +686,44 @@ Describe 'Push-BECRun' {
         $Rule.RiskReasons | Should -Contain 'Forwards or redirects mail to an external address'
         $Rule.RiskReasons | Should -Contain 'Deletes messages'
         $Rule.RiskReasons | Should -Contain 'Acts on all incoming mail'
+    }
+
+    It 'shows a disabled suspicious rule as Disabled and does not score it as a current rule' {
+        Mock New-ExoRequest {
+            switch ($cmdlet) {
+                'Get-AdminAuditLogConfig' { [pscustomobject]@{ UnifiedAuditLogIngestionEnabled = $true } }
+                'Get-InboxRule' { [pscustomobject]@{ Name = 'old forwarder'; Identity = 'r10'; Enabled = $false; ForwardTo = @('attacker@evil.example'); DeleteMessage = $true } }
+                'Get-MailboxJunkEmailConfiguration' { [pscustomobject]@{ TrustedSendersAndDomains = @(); BlockedSendersAndDomains = @() } }
+                'Get-AcceptedDomain' { [pscustomobject]@{ DomainName = 'contoso.com' } }
+                default { @() }
+            }
+        }
+        Invoke-BecRun -Item ($script:Item + @{ Scope = 'Full' })
+        $Rule = @($script:Saved.Results.NewRules)[0]
+        $Rule.Suspicious | Should -BeTrue -Because 'the content is still suspicious'
+        $Rule.Risk | Should -Be 'Disabled'
+        $Rule.Enabled | Should -BeFalse
+        $R = $script:Saved.Results
+        ($R.Score.Breakdown | Where-Object { $_.Signal -eq 'SuspiciousRules' }).Applied | Should -BeFalse
+        ($R.Score.Breakdown | Where-Object { $_.Signal -eq 'NewRules' }).Applied | Should -BeFalse
+    }
+
+    It 'marks a rule recently changed when Enable-InboxRule re-enabled it in the window' {
+        Mock New-ExoRequest {
+            switch ($cmdlet) {
+                'Get-AdminAuditLogConfig' { [pscustomobject]@{ UnifiedAuditLogIngestionEnabled = $true } }
+                'Get-InboxRule' { [pscustomobject]@{ Name = 'Old forwarder'; Identity = 'r11'; Enabled = $true; ForwardTo = @('attacker@evil.example') } }
+                'Get-MailboxJunkEmailConfiguration' { [pscustomobject]@{ TrustedSendersAndDomains = @(); BlockedSendersAndDomains = @() } }
+                'Get-AcceptedDomain' { [pscustomobject]@{ DomainName = 'contoso.com' } }
+                default { @() }
+            }
+        }
+        Mock Search-CIPPBecAuditLog -ParameterFilter { $Operations -contains 'Enable-InboxRule' } {
+            [pscustomobject]@{ Complete = $true; Cap = $null; Pages = 1; Records = @([pscustomobject]@{ Identity = 'e1'; Operation = 'Enable-InboxRule'; AuditData = [pscustomobject]@{ Operation = 'Enable-InboxRule'; UserId = 'victim@contoso.com'; CreationTime = '2026-08-19T01:00:00Z'; ClientIP = '203.0.113.10'; ObjectId = 'victim@contoso.com\Old forwarder' } }) }
+        }
+        Invoke-BecRun -Item ($script:Item + @{ Scope = 'Full' })
+        $Rule = @($script:Saved.Results.NewRules)[0]
+        $Rule.RecentlyChanged | Should -BeTrue -Because 'Enable-InboxRule carries the rule identity this window'
     }
 
     It 'marks a rule suspicious only when it hides mail with a reason to, not for an ordinary delete or archive rule' {

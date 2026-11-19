@@ -466,6 +466,7 @@ export const BEC_GROUPS = [
         // (operation, when, from where) is folded into its row; the full change history follows below.
         columns: [
           'Name',
+          'Enabled',
           'Risk',
           'RiskReasons',
           'LastChange',
@@ -1153,11 +1154,15 @@ export const becFindingFlags = (becData, windowDays = 7) => {
     ),
     NewRules: (() => {
       // Flag only the rules the backend marked suspicious (hiding, forwarding, delete, acts-on-all,
-      // sensitive keywords) - a benign rule is not worth a flag. Old reports fall back to RiskReasons.
+      // sensitive keywords). A disabled rule cannot act, so it is shown with Enabled=false but is not
+      // a current flag. Old reports without Suspicious fall back to RiskReasons.
       const suspicious = a(b.NewRules).filter(
         (r) =>
-          r.Suspicious ||
-          (Array.isArray(r.RiskReasons) && r.RiskReasons.length > 0)
+          r.Enabled !== false &&
+          (r.Suspicious ||
+            (r.Suspicious === undefined &&
+              Array.isArray(r.RiskReasons) &&
+              r.RiskReasons.length > 0))
       )
       return suspicious.length > 0
         ? {

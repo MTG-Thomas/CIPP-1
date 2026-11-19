@@ -35,7 +35,9 @@ function Get-CIPPBecMailActivity {
         [Parameter(Mandatory = $true)][datetime]$StartDate,
         [Parameter(Mandatory = $true)][datetime]$EndDate,
         [Parameter(Mandatory = $true)]$Heuristics,
-        [string]$Anchor
+        [string]$Anchor,
+        # Optional wall-clock budget for the detail re-read. The counts pass leaves it unset.
+        [datetime]$Deadline = [datetime]::MinValue
     )
 
     $UserOps = @($Heuristics.mailActivity.userOperations)
@@ -46,6 +48,7 @@ function Get-CIPPBecMailActivity {
     $Groups = @{}
     $AllRecords = [System.Collections.Generic.List[object]]::new()
     $Errors = [System.Collections.Generic.List[string]]::new()
+    $Legs = [ordered]@{}
     $Complete = $true
     $Cap = $null
     $RecordCount = 0
@@ -95,23 +98,29 @@ function Get-CIPPBecMailActivity {
 
     if ($UserOps.Count -gt 0) {
         try {
-            $Search = Search-CIPPBecAuditLog -TenantFilter $TenantFilter -StartDate $StartDate -EndDate $EndDate -Operations $UserOps -UserIds @($UserPrincipalName) -Anchor $Anchor -MaxPages $MaxPages
+            $Search = Search-CIPPBecAuditLog -TenantFilter $TenantFilter -StartDate $StartDate -EndDate $EndDate -Operations $UserOps -UserIds @($UserPrincipalName) -Anchor $Anchor -MaxPages $MaxPages -Deadline $Deadline
             $Search.Records | & $Accumulate
             $RecordCount = $RecordCount + @($Search.Records).Count
+            $Legs.User = [pscustomobject]@{ Complete = [bool]$Search.Complete; Cap = $Search.Cap; Error = $null }
             if (-not $Search.Complete) { $Complete = $false; $Cap = $Search.Cap }
         } catch {
-            $Errors.Add("user activity search: $((Get-NormalizedError -message $_.Exception.Message))")
+            $LegError = "user activity search: $((Get-NormalizedError -message $_.Exception.Message))"
+            $Errors.Add($LegError)
+            $Legs.User = [pscustomobject]@{ Complete = $false; Cap = $null; Error = $LegError }
         }
     }
     if ($OwnerOps.Count -gt 0) {
         try {
-            $Search = Search-CIPPBecAuditLog -TenantFilter $TenantFilter -StartDate $StartDate -EndDate $EndDate -Operations $OwnerOps -Anchor $Anchor -MaxPages $MaxPages
+            $Search = Search-CIPPBecAuditLog -TenantFilter $TenantFilter -StartDate $StartDate -EndDate $EndDate -Operations $OwnerOps -Anchor $Anchor -MaxPages $MaxPages -Deadline $Deadline
             $Owned = @($Search.Records).Where({ $_.AuditData -and ($_.AuditData.MailboxOwnerUPN -eq $UserPrincipalName -or $_.AuditData.UserId -eq $UserPrincipalName) })
             $Owned | & $Accumulate
             $RecordCount = $RecordCount + $Owned.Count
+            $Legs.Owner = [pscustomobject]@{ Complete = [bool]$Search.Complete; Cap = $Search.Cap; Error = $null }
             if (-not $Search.Complete) { $Complete = $false; $Cap = $Search.Cap }
         } catch {
-            $Errors.Add("send-as search: $((Get-NormalizedError -message $_.Exception.Message))")
+            $LegError = "send-as search: $((Get-NormalizedError -message $_.Exception.Message))"
+            $Errors.Add($LegError)
+            $Legs.Owner = [pscustomobject]@{ Complete = $false; Cap = $null; Error = $LegError }
         }
     }
 
@@ -140,5 +149,6 @@ function Get-CIPPBecMailActivity {
     $Result = New-CIPPBecCollectorResult -Data $Rows -Complete ($Complete -and $Errors.Count -eq 0) -Cap $Cap -Error ($(if ($Errors.Count -gt 0) { $Errors -join '; ' } else { $null })) -Count $Rows.Count
     $Result | Add-Member -NotePropertyName 'Summary' -NotePropertyValue $Summary -Force
     $Result | Add-Member -NotePropertyName 'Records' -NotePropertyValue $AllRecords.ToArray() -Force
+    $Result | Add-Member -NotePropertyName 'Legs' -NotePropertyValue $Legs -Force
     return $Result
 }

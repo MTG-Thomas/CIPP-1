@@ -65,7 +65,9 @@ function Search-CIPPBecAuditLog {
         [ValidateRange(1, 200)][int]$MaxPages = 10,
         [ValidateRange(1, 10080)][int]$MinSliceMinutes = 60,
         [ValidateRange(1, 16)][int]$MaxSliceDepth = 8,
-        [ValidateRange(0, 16)][int]$SliceDepth = 0
+        [ValidateRange(0, 16)][int]$SliceDepth = 0,
+        # Optional wall-clock budget for a detail pass. The counts pass leaves it unset.
+        [datetime]$Deadline = [datetime]::MinValue
     )
 
     $SearchParam = @{
@@ -95,6 +97,10 @@ function Search-CIPPBecAuditLog {
     $Stalled = $false
     $PageError = $null
     do {
+        if ($Deadline -ne [datetime]::MinValue -and (Get-Date).ToUniversalTime() -ge $Deadline.ToUniversalTime()) {
+            $PageError = "time budget reached after $($Records.Count) record(s)"
+            break
+        }
         $Pages++
         # A search with no hits returns nothing at all rather than an empty page. A transient failure on
         # a later page must not discard the pages already collected: stop here and report what we have as
@@ -144,6 +150,7 @@ function Search-CIPPBecAuditLog {
             MinSliceMinutes = $MinSliceMinutes
             MaxSliceDepth   = $MaxSliceDepth
             SliceDepth      = $SliceDepth + 1
+            Deadline        = $Deadline
         }
         if ($Operations) { $Common.Operations = $Operations }
         if ($UserIds) { $Common.UserIds = $UserIds }
@@ -153,8 +160,15 @@ function Search-CIPPBecAuditLog {
         if ($FreeText) { $Common.FreeText = $FreeText }
         if ($Anchor) { $Common.Anchor = $Anchor }
 
-        $Left = Search-CIPPBecAuditLog @Common -StartDate $StartDate -EndDate $Mid
-        $Right = Search-CIPPBecAuditLog @Common -StartDate $Mid -EndDate $EndDate
+        # With a deadline, take the newest half first: a budget that runs out loses the oldest
+        # activity, not the activity nearest the incident.
+        if ($Deadline -ne [datetime]::MinValue) {
+            $Right = Search-CIPPBecAuditLog @Common -StartDate $Mid -EndDate $EndDate
+            $Left = Search-CIPPBecAuditLog @Common -StartDate $StartDate -EndDate $Mid
+        } else {
+            $Left = Search-CIPPBecAuditLog @Common -StartDate $StartDate -EndDate $Mid
+            $Right = Search-CIPPBecAuditLog @Common -StartDate $Mid -EndDate $EndDate
+        }
 
         $Merged = [System.Collections.Generic.List[object]]::new()
         $MergedSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)

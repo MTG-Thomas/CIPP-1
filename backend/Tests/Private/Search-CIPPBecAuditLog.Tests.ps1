@@ -40,6 +40,15 @@ Describe 'Search-CIPPBecAuditLog' {
         $Result.Records[0].Operation | Should -Be 'New-InboxRule'
     }
 
+    It 'stops before the first page when the detail deadline has already passed' {
+        Mock New-ExoRequest { throw 'Exchange must not be called after the deadline' }
+        $Result = Search-CIPPBecAuditLog -TenantFilter 'contoso.com' -StartDate $script:Start -EndDate $script:End -Deadline (Get-Date).AddSeconds(-1)
+        $Result.Complete | Should -BeFalse
+        $Result.Cap | Should -Match 'time budget'
+        $Result.Records.Count | Should -Be 0
+        Should -Invoke New-ExoRequest -Times 0
+    }
+
     It 'sends ReturnLargeSet, ResultSize and an array UserIds with a stable session id' {
         Mock New-ExoRequest { $script:Calls.Add($cmdParams); New-Page -From 1 -Count 1 -Total 1 }
         $null = Search-CIPPBecAuditLog -TenantFilter 'contoso.com' -StartDate $script:Start -EndDate $script:End -Operations @('A') -UserIds 'user@contoso.com' -PageSize 100
